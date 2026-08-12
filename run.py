@@ -8,6 +8,7 @@ import sys, os, subprocess, json, urllib.request, multiprocessing, socket, time,
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from bisect import bisect_right
 
 # ── 获取公网 IP (仅在最后提供下载链接时使用，避免启动卡顿) ──
 def get_public_ip():
@@ -31,7 +32,7 @@ def get_public_ip():
     ]
     for cmd, timeout in dns_queries:
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout)
             out = r.stdout.strip().strip('"')
             if out and "." in out and out.count(".") == 3:
                 parts = out.split(".")
@@ -77,8 +78,42 @@ API_URL    = "https://api.250887.xyz/check"
 if CF_SCANNER.is_file():
     CF_SCANNER.chmod(0o755)
 
+# ── 扫描目标限制 ──
+def prepare_targets(cidrs, max_ips):
+    """生成 masscan 输入文件，限制扫描的总 IP 数。0 表示不限制。"""
+    target_file = BASE / "targets.txt"
+    networks = [ipaddress.IPv4Network(cidr, strict=False) for cidr in cidrs]
+    total_ips = sum(network.num_addresses for network in networks)
+
+    # 不限制时保留 CIDR，避免生成大量单 IP 文件。
+    if max_ips <= 0 or total_ips <= max_ips:
+        target_file.write_text(
+            "\n".join(str(network) for network in networks) + "\n",
+            encoding="ascii"
+        )
+        print(f"  实际扫描目标: {total_ips} 个 IP（未截断）")
+        return
+
+    # 从所有 CIDR 的完整地址空间中随机且不重复地抽取指定数量的 IP。
+    ends = []
+    current = 0
+    for network in networks:
+        current += network.num_addresses
+        ends.append(current)
+
+    positions = random.sample(range(total_ips), max_ips)
+    with target_file.open("w", encoding="ascii") as f:
+        for position in positions:
+            network_index = bisect_right(ends, position)
+            previous_end = ends[network_index - 1] if network_index > 0 else 0
+            ip = networks[network_index].network_address + (position - previous_end)
+            f.write(str(ip) + "\n")
+
+    print(f"  全部网段共 {total_ips} 个 IP，已随机抽取 {max_ips} 个 IP 扫描")
+
+
 # ── Step 1: ASN → CIDR ──
-def fetch_prefixes(asns):
+def fetch_prefixes(asns, max_ips):
     raw_cidrs = []
     for asn in asns:
         url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn}"
@@ -119,12 +154,13 @@ def fetch_prefixes(asns):
     cidrs = [str(net) for net in merged_nets]
 
     cidr_file = BASE / "cidrs.txt"
-    cidr_file.write_text("\n".join(cidrs))
-    print(f"  共获取 {len(raw_cidrs)} 个 CIDR，合并去重后实际扫描 {len(cidrs)} 个网段")
+    cidr_file.write_text("\n".join(cidrs) + "\n", encoding="utf-8")
+    print(f"  共获取 {len(raw_cidrs)} 个 CIDR，合并去重后得到 {len(cidrs)} 个网段")
+    prepare_targets(cidrs, max_ips)
     return cidrs
 
 # ── 端口解析 ──
-with open(BASE / "ports.txt") as f:
+with open(BASE / "ports.txt", encoding="utf-8") as f:
     _default_ports = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 DEFAULT_PORTS = ",".join(_default_ports)
 
@@ -154,10 +190,10 @@ def run_masscan(ports_str=None):
     if not ports or ports == ",":
         ports = DEFAULT_PORTS
     result_file = BASE / "masscan_result.txt"
-    ip_file = BASE / "cidrs.txt"
+    ip_file = BASE / "targets.txt"
 
     if not ip_file.exists() or ip_file.stat().st_size == 0:
-         raise ValueError("cidrs.txt 文件为空，无法启动 masscan 扫描。")
+         raise ValueError("targets.txt 文件为空，无法启动 masscan 扫描。")
 
     if result_file.exists():
         if os.geteuid() == 0:
@@ -177,7 +213,7 @@ def run_masscan(ports_str=None):
     print(f"  [运行 masscan] 速率: {MASSCAN_RATE} pps, 端口: {ports}")
     
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                            text=True, bufsize=1)
+                            universal_newlines=True, bufsize=1)
     bar_width = 30
     last_pct = -1
     stderr_lines = []
@@ -247,7 +283,7 @@ def cf_scan():
 
     proc = subprocess.Popen(
         [str(CF_SCANNER), "-i", str(new_file), "-o", str(hits_file), "-c", str(CF_SCANNER_CONC)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1
     )
     bar_width = 30
     last_pct = -1
@@ -292,7 +328,7 @@ def api_verify():
         "--api", API_URL,
         "--chunk", str(API_CHUNK),
         "--concurrent", str(API_CONCURRENT)
-    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
 
     for line in proc.stdout:
         sys.stdout.write("  " + line)
@@ -311,7 +347,7 @@ def speed_test():
         return
 
     lines = []
-    with open(verified_file) as f:
+    with open(verified_file, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("IP地址"):
@@ -355,7 +391,7 @@ def speed_test():
                     "-o", "/dev/null", "-s", "-w", "%{speed_download}",
                     "--connect-timeout", "5", "--max-time", "20",
                     "https://speed.cloudflare.com/__down?bytes=10485760"
-                ], capture_output=True, text=True, timeout=25)
+                ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=25)
                 speed_bps = float(r.stdout.strip() or 0)
                 speed_mbps = round(speed_bps * 8 / 1000000, 2)
             except:
@@ -387,7 +423,7 @@ def speed_test():
 
     sys.stderr.write(f"\r  [{'█' * 30}] 100.0% | 测速完成: {total} 个节点{'':15}\n")
     
-    with open(verified_file, "w") as f:
+    with open(verified_file, "w", encoding="utf-8") as f:
         f.write("IP地址,端口,TLS,数据中心,地区,城市,网络延迟,下载速度,ASN\n")
         f.write("\n".join(results) + "\n")
 
@@ -403,7 +439,7 @@ def output_csv(asns):
     output = BASE / f"output_{asn_tag}_{ts}.csv"
 
     lines = []
-    with open(verified_file) as f:
+    with open(verified_file, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("IP地址"):
@@ -416,7 +452,7 @@ def output_csv(asns):
             if line.count(",") >= 8:
                 lines.append(line)
 
-    with open(output, "w") as f:
+    with open(output, "w", encoding="utf-8") as f:
         f.write("IP地址,端口,TLS,数据中心,地区,城市,网络延迟,下载速度,ASN\n")
         for line in lines:
             f.write(line + "\n")
@@ -438,7 +474,7 @@ def output_csv(asns):
         import signal
         try:
             out = subprocess.run(["ss", "-tlnp", f"sport = :{p}"],
-                                 capture_output=True, text=True, timeout=5)
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5)
             for line in out.stdout.split("\n"):
                 if f":{p}" in line and "users:" in line:
                     m = __import__("re").search(r"pid=(\d+)", line)
@@ -517,7 +553,7 @@ if __name__ == "__main__":
             print("  ssh 断线不杀: screen -S scan → python3 run.py AS209242 → Ctrl+A D")
             sys.exit(1)
     
-    # ── 🌟 新增：用户自定义 PPS 速率 ──
+    # ── 用户自定义扫描速率与目标数量 ──
     try:
         pps_input = input("  设置 masscan 扫描速率 PPS (回车默认 1000): ").strip()
         if pps_input:
@@ -528,7 +564,19 @@ if __name__ == "__main__":
     except (EOFError, KeyboardInterrupt):
         pass
 
-    print(f"\n  配置: masscan={MASSCAN_RATE}pps, cf-scanner={CF_SCANNER_CONC}c, API={API_CONCURRENT}c(块{API_CHUNK})")
+    max_target_ips = 5000
+    try:
+        limit_input = input("  最大扫描 IP 数 (回车默认 5000，输入 0 不限制): ").strip()
+        if limit_input:
+            if limit_input.isdigit():
+                max_target_ips = int(limit_input)
+            else:
+                print("  ⚠️ 输入无效，使用默认限制 5000 个 IP")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+    target_limit_text = "不限制" if max_target_ips == 0 else f"{max_target_ips} 个 IP"
+    print(f"\n  配置: masscan={MASSCAN_RATE}pps, 最大目标={target_limit_text}, cf-scanner={CF_SCANNER_CONC}c, API={API_CONCURRENT}c(块{API_CHUNK})")
     print(f"  ASN: {', '.join(f'AS{a}' for a in asns)}\n")
 
     scan_ports = DEFAULT_PORTS
@@ -551,7 +599,7 @@ if __name__ == "__main__":
                 break
 
     steps = [
-        ("1/6 ASN→CIDR", lambda: fetch_prefixes(asns)),
+        ("1/6 ASN→CIDR", lambda: fetch_prefixes(asns, max_target_ips)),
         ("2/6 masscan",   lambda: run_masscan(scan_ports)),
         ("3/6 cf-scanner", cf_scan),
         ("4/6 API精筛",   api_verify),
