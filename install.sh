@@ -26,7 +26,7 @@ info()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn()  { echo -e "${RED}[!]${NC} $*"; }
 
 PROJECT_DIR="$HOME/ASNIPtest"
-REPO_URL="https://github.250887.xyz/https://github.com/cpddli/ASNIPtest.git"
+REPO_URL="https://github.250887.xyz/https://github.com/mrdoudou1/ASNIP.git"
 
 # ── 卸载 ──
 do_uninstall() {
@@ -134,25 +134,44 @@ do_install() {
     # 系统依赖
     info "检查系统依赖..."
     install_pkg() {
-        local pkg=$1
-        if command -v "$pkg" &>/dev/null || dpkg -l "$pkg" &>/dev/null 2>&1 || rpm -q "$pkg" &>/dev/null 2>&1; then
-            return 0
-        fi
-        warn "安装 $pkg ..."
-        if command -v apt &>/dev/null; then
-            $SUDO apt update -qq && $SUDO apt install -y -qq "$pkg"
-        elif command -v yum &>/dev/null; then
-            $SUDO yum install -y -q "$pkg"
+        local deb_pkg="$1"
+        local rpm_pkg="${2:-$1}"
+        local pkg=""
+
+        if command -v apt-get &>/dev/null; then
+            pkg="$deb_pkg"
+            if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
+                return 0
+            fi
+            warn "安装 $pkg ..."
+            $SUDO apt-get update -qq
+            $SUDO apt-get install -y -qq "$pkg"
+
         elif command -v dnf &>/dev/null; then
+            pkg="$rpm_pkg"
+            if rpm -q "$pkg" &>/dev/null; then
+                return 0
+            fi
+            warn "安装 $pkg ..."
             $SUDO dnf install -y -q "$pkg"
+
+        elif command -v yum &>/dev/null; then
+            pkg="$rpm_pkg"
+            if rpm -q "$pkg" &>/dev/null; then
+                return 0
+            fi
+            warn "安装 $pkg ..."
+            $SUDO yum install -y -q "$pkg"
+
         else
-            warn "未检测到包管理器，请手动安装: $pkg"
+            warn "未检测到包管理器，请手动安装: $deb_pkg / $rpm_pkg"
+            return 1
         fi
     }
     install_pkg masscan
-    install_pkg libpcap-dev
+    install_pkg libpcap-dev libpcap-devel
     install_pkg prips
-    install_pkg dnsutils
+    install_pkg dnsutils bind-utils
     install_pkg python3
     install_pkg git
 
