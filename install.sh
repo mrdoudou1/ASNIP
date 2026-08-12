@@ -170,7 +170,6 @@ do_install() {
     }
     install_pkg masscan
     install_pkg libpcap-dev libpcap-devel
-    install_pkg prips
     install_pkg dnsutils bind-utils
     install_pkg python3
     install_pkg git
